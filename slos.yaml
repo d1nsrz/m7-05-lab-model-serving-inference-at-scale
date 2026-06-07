@@ -1,0 +1,138 @@
+service: vision-moderation
+
+# ─── Partner SLA context ────────────────────────────────────────────────────
+# External SLA guarantees to partners:
+#   • Availability ≥ 99.5 % (rolling 30-day window)
+#   • Refunds triggered if p95 latency > 500 ms over any rolling 1-hour window
+#
+# Each internal SLO below is STRICTER than the corresponding SLA clause so
+# that alerts fire — and corrective action begins — before partner obligations
+# are breached.
+# ────────────────────────────────────────────────────────────────────────────
+
+slos:
+
+  # ─── 1. Availability ─────────────────────────────────────────────────────
+  # Internal objective: 99.7 %
+  # External SLA:       99.5 %
+  #
+  # Safety margin: error budget at 99.7 % = 0.003 × 30 × 24 × 60 = 129.6 min
+  #                error budget at 99.5 % = 0.005 × 30 × 24 × 60 = 216.0 min
+  # Buffer before SLA breach: 216 − 129.6 = 86.4 minutes per 30-day window.
+  # Internal SLO exhaustion does not immediately trigger partner refunds;
+  # it gives the team 86+ minutes of remediation time.
+
+  - name: availability
+    sli:
+      type: request_based
+      description: >
+        Proportion of all HTTP requests to /v1/classify and /v1/batch that
+        are classified as "good" (see definition below), measured at the
+        ingress load balancer over each 5-minute evaluation window.
+      good_request_definition: >
+        A request is GOOD if it returns an HTTP status code in the 2xx range
+        (200, 201, 202, 204) or in the 4xx range (400, 401, 403, 404, 422)
+        AND the response is delivered within 30 s of the request being
+        received at the ingress.
+        Rationale: 4xx responses indicate the service is healthy and correctly
+        rejecting invalid or unauthorised input; the service is operational.
+        A request is BAD if it returns an HTTP 5xx status code, results in a
+        TCP-level reset or connection refusal, or times out at the ingress
+        boundary (no response within 30 s). Client-side retries are not
+        counted as separate requests.
+      measurement_point: ingress load balancer (upstream of any service mesh)
+    objective: 0.997            # rolling 30-day window; external SLA = 0.995
+    window: 30d
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        # At 14.4× burn rate, the 30-day error budget (129.6 min) is exhausted
+        # in ≈ 2.1 days.  Firing after 1 h of this burn rate means ≈ 2 % of
+        # the monthly budget has been consumed — wake on-call immediately.
+        # Recommend pairing with a 5-minute short window to suppress flaps.
+      - severity: ticket
+        burn_rate: 6
+        window: 6h
+        # At 6× burn rate, budget exhausted in ≈ 5 days.
+        # Sustained over 6 h this confirms a real degradation trend;
+        # create an incident ticket and begin non-emergency investigation.
+
+
+  # ─── 2. Latency p95 ──────────────────────────────────────────────────────
+  # Internal threshold: 250 ms  (exactly half the SLA refund trigger of 500 ms)
+  # Partner SLA refund trigger: p95 > 500 ms over a rolling 1-hour window.
+  #
+  # Hitting this SLO's burn-rate alerts gives the team time to act before
+  # latency degrades from 250 ms toward the 500 ms SLA threshold.
+
+  - name: latency_p95
+    sli:
+      type: request_based
+      description: >
+        Proportion of HTTP requests to /v1/classify whose end-to-end latency
+        is at or below 250 ms, measured at the ingress load balancer.
+      good_request_definition: >
+        A request to /v1/classify is GOOD if the time elapsed from the first
+        byte of the request being received at the ingress load balancer to the
+        last byte of the response being sent by that same ingress is ≤ 250 ms.
+        Latency is captured via a Prometheus histogram exported by the ingress
+        controller, with bucket boundaries at: 25, 50, 100, 150, 200, 250,
+        300, 400, 500, 750, 1000 ms (≤ 10 ms effective bucket width around the
+        SLO threshold). Goodness fraction is computed as
+        histogram_fraction_le{le="0.25"} over a 5-minute rolling window.
+        The /v1/batch endpoint is excluded from this SLO; it operates under a
+        separate timeout budget (10 s p99) not defined here.
+      measurement_point: ingress load balancer
+    objective: 0.95             # 95 % of /v1/classify requests ≤ 250 ms; rolling 30-day
+    window: 30d
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        # Error budget = 5 % of requests.  At 14.4× burn rate, exhausted
+        # in ≈ 2.1 days.  1 h window catches fast degradation (e.g. a bad
+        # rollout or a Redis spike inflating tail latency).
+      - severity: ticket
+        burn_rate: 6
+        window: 6h
+        # Sustained slow degradation (e.g. gradual GPU memory pressure);
+        # exhausted in ≈ 5 days at this rate.
+
+
+  # ─── 3. Latency p99 ──────────────────────────────────────────────────────
+  # Catches tail-latency outliers invisible at p95.
+  # 400 ms threshold sits below the 500 ms partner SLA refund trigger,
+  # ensuring even extreme outliers are tracked before they threaten the SLA.
+
+  - name: latency_p99
+    sli:
+      type: request_based
+      description: >
+        Proportion of HTTP requests to /v1/classify whose end-to-end latency
+        is at or below 400 ms, measured at the ingress load balancer.
+      good_request_definition: >
+        A request to /v1/classify is GOOD if its end-to-end latency (same
+        measurement point and method as latency_p95) is ≤ 400 ms.
+        The 400 ms threshold is chosen to:
+          (a) sit above the 250 ms p95 budget to absorb legitimate tail
+              variance (e.g. garbage collection pauses, Redis tail spikes);
+          (b) remain below the 500 ms partner SLA refund trigger so that even
+              p99 outliers do not directly threaten SLA compliance.
+        Uses the same ingress histogram as latency_p95; goodness fraction
+        is histogram_fraction_le{le="0.40"} over a 5-minute rolling window.
+      measurement_point: ingress load balancer
+    objective: 0.99             # 99 % of /v1/classify requests ≤ 400 ms; rolling 30-day
+    window: 30d
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        # Error budget = 1 % of requests.  At 14.4× burn rate, exhausted
+        # in ≈ 2.1 days.  Tail-latency spikes are often the first symptom of
+        # GPU saturation or Redis cluster degradation; page immediately.
+      - severity: ticket
+        burn_rate: 6
+        window: 6h
+        # Slow-moving tail regression (e.g. gradual memory fragmentation);
+        # budget exhausted in ≈ 5 days.
